@@ -1,38 +1,44 @@
 import os
 import time
+import json
 import sqlite3
 import threading
 import requests
 from datetime import datetime, timedelta
 
-# =========================
+
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 8203764232
 
 DB_FILE = "breaking_repo.db"
 
-# مقدار پیش‌فرض
 DEFAULT_REPORT_MAX = 100
 DEFAULT_EMAIL_MAX = 100
 
-# زمان پردازش داخلی
 PROCESS_DELAY = 330
 
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN پیدا نشد.")
+    raise RuntimeError(
+        "BOT_TOKEN پیدا نشد. متغیر BOT_TOKEN را در Railway Variables قرار بده."
+    )
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 
-# =========================
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
 
 def db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_FILE,
+        check_same_thread=False,
+        timeout=30
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -53,10 +59,10 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            kind TEXT,
-            target TEXT,
-            count INTEGER,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            target TEXT NOT NULL,
+            count INTEGER NOT NULL,
             status TEXT DEFAULT 'pending',
             created_at TEXT
         )
@@ -76,26 +82,18 @@ def init_db():
         )
     """)
 
-    # تنظیمات اولیه
-    cur.execute(
-        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-        ("force_join", "0")
-    )
+    defaults = {
+        "force_join": "0",
+        "force_channel": "",
+        "report_max": str(DEFAULT_REPORT_MAX),
+        "email_max": str(DEFAULT_EMAIL_MAX),
+    }
 
-    cur.execute(
-        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-        ("force_channel", "")
-    )
-
-    cur.execute(
-        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-        ("report_max", str(DEFAULT_REPORT_MAX))
-    )
-
-    cur.execute(
-        "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-        ("email_max", str(DEFAULT_EMAIL_MAX))
-    )
+    for key, value in defaults.items():
+        cur.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+            (key, value)
+        )
 
     conn.commit()
     conn.close()
@@ -104,19 +102,38 @@ def init_db():
 init_db()
 
 
-# =========================
+# =========================================================
 # TELEGRAM API
-# =========================
+# =========================================================
 
 def tg(method, data=None):
     try:
-        r = requests.post(
+        response = requests.post(
             f"{API}/{method}",
             data=data or {},
-            timeout=30
+            timeout=35
         )
-        return r.json()
-    except Exception:
+
+        try:
+            result = response.json()
+        except Exception:
+            print("Telegram returned non-JSON:", response.text)
+            return {}
+
+        if not result.get("ok"):
+            print(
+                f"Telegram API ERROR [{method}]:",
+                result
+            )
+
+        return result
+
+    except requests.RequestException as e:
+        print(f"NETWORK ERROR [{method}]:", e)
+        return {}
+
+    except Exception as e:
+        print(f"TG ERROR [{method}]:", e)
         return {}
 
 
@@ -126,8 +143,12 @@ def send(chat_id, text, reply_markup=None):
         "text": text
     }
 
-    if reply_markup:
-        data["reply_markup"] = reply_markup
+    if reply_markup is not None:
+        # مهم: Telegram باید JSON دریافت کند
+        data["reply_markup"] = json.dumps(
+            reply_markup,
+            ensure_ascii=False
+        )
 
     return tg("sendMessage", data)
 
@@ -139,25 +160,30 @@ def edit(chat_id, message_id, text, reply_markup=None):
         "text": text
     }
 
-    if reply_markup:
-        data["reply_markup"] = reply_markup
+    if reply_markup is not None:
+        # مهم: Telegram باید JSON دریافت کند
+        data["reply_markup"] = json.dumps(
+            reply_markup,
+            ensure_ascii=False
+        )
 
     return tg("editMessageText", data)
 
 
-def answer(callback_id, text=""):
-    return tg(
-        "answerCallbackQuery",
-        {
-            "callback_query_id": callback_id,
-            "text": text
-        }
-    )
+def answer(callback_id, text=None):
+    data = {
+        "callback_query_id": callback_id
+    }
+
+    if text:
+        data["text"] = text
+
+    return tg("answerCallbackQuery", data)
 
 
-# =========================
-# BUTTON COLORS
-# =========================
+# =========================================================
+# COLORED BUTTONS
+# =========================================================
 
 def blue(text, callback_data):
     return {
@@ -199,159 +225,209 @@ def green_url(text, url):
     }
 
 
-# =========================
+# =========================================================
 # SETTINGS
-# =========================
+# =========================================================
 
 def get_setting(key, default=None):
     conn = db()
-    row = conn.execute(
-        "SELECT value FROM settings WHERE key=?",
-        (key,)
-    ).fetchone()
-    conn.close()
 
-    if row:
-        return row["value"]
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (key,)
+        ).fetchone()
 
-    return default
+        if row:
+            return row["value"]
+
+        return default
+
+    finally:
+        conn.close()
 
 
 def set_setting(key, value):
     conn = db()
 
-    conn.execute("""
-        INSERT INTO settings(key,value)
-        VALUES(?,?)
-        ON CONFLICT(key)
-        DO UPDATE SET value=excluded.value
-    """, (key, str(value)))
+    try:
+        conn.execute("""
+            INSERT INTO settings(key, value)
+            VALUES(?, ?)
+            ON CONFLICT(key)
+            DO UPDATE SET value=excluded.value
+        """, (key, str(value)))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+
+    finally:
+        conn.close()
 
 
 def get_report_max():
     try:
-        return max(1, min(100, int(get_setting(
-            "report_max",
-            DEFAULT_REPORT_MAX
-        ))))
-    except:
+        value = int(
+            get_setting(
+                "report_max",
+                DEFAULT_REPORT_MAX
+            )
+        )
+
+        return max(1, min(100, value))
+
+    except Exception:
         return DEFAULT_REPORT_MAX
 
 
 def get_email_max():
     try:
-        return max(1, min(100, int(get_setting(
-            "email_max",
-            DEFAULT_EMAIL_MAX
-        ))))
-    except:
+        value = int(
+            get_setting(
+                "email_max",
+                DEFAULT_EMAIL_MAX
+            )
+        )
+
+        return max(1, min(100, value))
+
+    except Exception:
         return DEFAULT_EMAIL_MAX
 
 
-# =========================
+# =========================================================
 # USERS
-# =========================
+# =========================================================
 
 def save_user(user):
     conn = db()
 
-    conn.execute("""
-        INSERT INTO users(user_id, username, first_name, joined_at)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-    """, (
-        user["id"],
-        user.get("username", ""),
-        user.get("first_name", ""),
-        datetime.now().isoformat()
-    ))
+    try:
+        conn.execute("""
+            INSERT INTO users(
+                user_id,
+                username,
+                first_name,
+                joined_at
+            )
+            VALUES(?, ?, ?, ?)
 
-    conn.commit()
-    conn.close()
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name
+        """, (
+            user["id"],
+            user.get("username", ""),
+            user.get("first_name", ""),
+            datetime.now().isoformat()
+        ))
+
+        conn.commit()
+
+    finally:
+        conn.close()
 
 
 def users_count():
     conn = db()
-    value = conn.execute(
-        "SELECT COUNT(*) AS c FROM users"
-    ).fetchone()["c"]
-    conn.close()
-    return value
+
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM users"
+        ).fetchone()["c"]
+
+    finally:
+        conn.close()
 
 
 def requests_count():
     conn = db()
-    value = conn.execute(
-        "SELECT COUNT(*) AS c FROM requests"
-    ).fetchone()["c"]
-    conn.close()
-    return value
+
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM requests"
+        ).fetchone()["c"]
+
+    finally:
+        conn.close()
 
 
-# =========================
+# =========================================================
 # SUBSCRIPTIONS
-# =========================
+# =========================================================
 
 def add_subscription(user_id, days):
     conn = db()
 
-    expires = datetime.now() + timedelta(days=days)
+    try:
+        now = datetime.now()
 
-    old = conn.execute(
-        "SELECT expires_at FROM subscriptions WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
+        old = conn.execute(
+            "SELECT expires_at FROM subscriptions WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
 
-    if old:
-        try:
-            old_date = datetime.fromisoformat(old["expires_at"])
+        expires = now + timedelta(days=days)
 
-            if old_date > datetime.now():
-                expires = old_date + timedelta(days=days)
-        except:
-            pass
+        if old:
+            try:
+                old_date = datetime.fromisoformat(
+                    old["expires_at"]
+                )
 
-    conn.execute("""
-        INSERT INTO subscriptions(user_id, expires_at)
-        VALUES(?,?)
-        ON CONFLICT(user_id)
-        DO UPDATE SET expires_at=excluded.expires_at
-    """, (
-        user_id,
-        expires.isoformat()
-    ))
+                if old_date > now:
+                    expires = old_date + timedelta(days=days)
 
-    conn.commit()
-    conn.close()
+            except Exception:
+                pass
+
+        conn.execute("""
+            INSERT INTO subscriptions(
+                user_id,
+                expires_at
+            )
+            VALUES(?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                expires_at=excluded.expires_at
+        """, (
+            user_id,
+            expires.isoformat()
+        ))
+
+        conn.commit()
+
+    finally:
+        conn.close()
 
 
 def remove_subscription(user_id):
     conn = db()
 
-    conn.execute(
-        "DELETE FROM subscriptions WHERE user_id=?",
-        (user_id,)
-    )
+    try:
+        conn.execute(
+            "DELETE FROM subscriptions WHERE user_id=?",
+            (user_id,)
+        )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+
+    finally:
+        conn.close()
 
 
 def has_subscription(user_id):
     conn = db()
 
-    row = conn.execute(
-        "SELECT expires_at FROM subscriptions WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT expires_at FROM subscriptions WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
 
-    conn.close()
+    finally:
+        conn.close()
 
     if not row:
         return False
@@ -360,25 +436,30 @@ def has_subscription(user_id):
         return datetime.fromisoformat(
             row["expires_at"]
         ) > datetime.now()
-    except:
+
+    except Exception:
         return False
 
 
 def subscription_text(user_id):
     conn = db()
 
-    row = conn.execute(
-        "SELECT expires_at FROM subscriptions WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT expires_at FROM subscriptions WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
 
-    conn.close()
+    finally:
+        conn.close()
 
     if not row:
         return "❌ اشتراک فعال ندارید."
 
     try:
-        expires = datetime.fromisoformat(row["expires_at"])
+        expires = datetime.fromisoformat(
+            row["expires_at"]
+        )
 
         if expires <= datetime.now():
             return "❌ اشتراک شما منقضی شده است."
@@ -388,119 +469,137 @@ def subscription_text(user_id):
             f"📅 انقضا: {expires.strftime('%Y-%m-%d %H:%M')}"
         )
 
-    except:
+    except Exception:
         return "❌ اطلاعات اشتراک قابل خواندن نیست."
 
 
-# =========================
+# =========================================================
 # REQUESTS
-# =========================
+# =========================================================
 
 def create_request(user_id, kind, target, count):
     conn = db()
 
-    cur = conn.execute("""
-        INSERT INTO requests(
+    try:
+        cursor = conn.execute("""
+            INSERT INTO requests(
+                user_id,
+                kind,
+                target,
+                count,
+                status,
+                created_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
+        """, (
             user_id,
             kind,
             target,
             count,
-            status,
-            created_at
-        )
-        VALUES(?,?,?,?,?,?)
-    """, (
-        user_id,
-        kind,
-        target,
-        count,
-        "pending",
-        datetime.now().isoformat()
-    ))
+            "pending",
+            datetime.now().isoformat()
+        ))
 
-    request_id = cur.lastrowid
+        conn.commit()
 
-    conn.commit()
-    conn.close()
+        return cursor.lastrowid
 
-    return request_id
+    finally:
+        conn.close()
 
 
 def complete_request(request_id):
     conn = db()
 
-    conn.execute("""
-        UPDATE requests
-        SET status='completed'
-        WHERE id=?
-    """, (request_id,))
+    try:
+        conn.execute("""
+            UPDATE requests
+            SET status='completed'
+            WHERE id=?
+        """, (request_id,))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+
+    finally:
+        conn.close()
 
 
 def delayed_result(chat_id, request_id, kind):
-    time.sleep(PROCESS_DELAY)
+    try:
+        time.sleep(PROCESS_DELAY)
 
-    complete_request(request_id)
+        complete_request(request_id)
 
-    if kind == "report":
-        text = (
-            "✅ پردازش داخلی انجام شد.\n\n"
-            "درخواست شما با موفقیت ثبت و پردازش شد."
+        if kind == "report":
+            text = (
+                "✅ پردازش داخلی انجام شد.\n\n"
+                "درخواست شما ثبت و پردازش شد."
+            )
+
+        else:
+            text = (
+                "✅ پردازش داخلی انجام شد.\n\n"
+                "متن ایمیل شما ثبت و پردازش شد."
+            )
+
+        send(
+            chat_id,
+            text,
+            home_keyboard()
         )
-    else:
-        text = (
-            "✅ پردازش داخلی انجام شد.\n\n"
-            "متن ایمیل شما با موفقیت ثبت و پردازش شد."
-        )
 
-    send(
-        chat_id,
-        text,
-        home_keyboard()
-    )
+    except Exception as e:
+        print("DELAY ERROR:", e)
 
 
-# =========================
+# =========================================================
 # TELEGRAM LINK VALIDATION
-# =========================
+# =========================================================
 
 def is_telegram_link(text):
-    text = text.strip().lower()
+    text = text.strip()
 
-    if not (
-        text.startswith("https://t.me/")
-        or text.startswith("http://t.me/")
-        or text.startswith("https://telegram.me/")
-        or text.startswith("http://telegram.me/")
-    ):
+    lower = text.lower()
+
+    valid_prefixes = (
+        "https://t.me/",
+        "http://t.me/",
+        "https://telegram.me/",
+        "http://telegram.me/"
+    )
+
+    if not lower.startswith(valid_prefixes):
         return False
 
-    # نباید لینک خالی باشد
-    if text.endswith("/"):
+    # بعد از دامنه باید چیزی وجود داشته باشد
+    remainder = lower.split("/", 3)
+
+    if len(remainder) < 4:
         return False
 
-    # لینک‌های تلگرام
-    blocked = [
-        "t.me/addstickers/",
-        "t.me/share/",
-        "t.me/iv",
-        "t.me/s/",
-        "telegram.me/addstickers/",
-        "telegram.me/share/"
-    ]
+    username = remainder[3].strip()
+
+    if not username:
+        return False
+
+    # لینک‌های نامناسب برای این بخش
+    blocked = (
+        "addstickers/",
+        "share/",
+        "iv",
+        "s/"
+    )
 
     for item in blocked:
-        if item in text:
+        if item in username:
             return False
 
     return True
 
 
-# =========================
+# =========================================================
 # KEYBOARDS
-# =========================
+# =========================================================
 
 def home_keyboard():
     return {
@@ -528,10 +627,16 @@ def request_keyboard():
     return {
         "inline_keyboard": [
             [
-                blue("🔗 ثبت لینک تلگرام", "request_link")
+                blue(
+                    "🔗 ثبت لینک تلگرام",
+                    "request_link"
+                )
             ],
             [
-                red("🔙 بازگشت", "home")
+                red(
+                    "🔙 بازگشت",
+                    "home"
+                )
             ]
         ]
     }
@@ -541,10 +646,16 @@ def email_keyboard():
     return {
         "inline_keyboard": [
             [
-                blue("📧 ثبت متن ایمیل", "email_text")
+                blue(
+                    "📧 ثبت متن ایمیل",
+                    "email_text"
+                )
             ],
             [
-                red("🔙 بازگشت", "home")
+                red(
+                    "🔙 بازگشت",
+                    "home"
+                )
             ]
         ]
     }
@@ -554,7 +665,10 @@ def back_keyboard():
     return {
         "inline_keyboard": [
             [
-                red("🔙 بازگشت", "home")
+                red(
+                    "🔙 بازگشت",
+                    "home"
+                )
             ]
         ]
     }
@@ -564,47 +678,84 @@ def admin_keyboard():
     return {
         "inline_keyboard": [
             [
-                blue("👥 تعداد کاربران", "admin_users"),
-                blue("📊 آمار درخواست‌ها", "admin_stats")
+                blue(
+                    "👥 تعداد کاربران",
+                    "admin_users"
+                ),
+                blue(
+                    "📊 آمار درخواست‌ها",
+                    "admin_stats"
+                )
             ],
             [
-                green("💎 افزودن اشتراک", "admin_add_sub"),
-                red("❌ حذف اشتراک", "admin_remove_sub")
+                green(
+                    "💎 افزودن اشتراک",
+                    "admin_add_sub"
+                ),
+                red(
+                    "❌ حذف اشتراک",
+                    "admin_remove_sub"
+                )
             ],
             [
-                green("➕ افزایش اشتراک", "admin_extend_sub"),
-                blue("📢 عضویت اجباری", "admin_force")
+                green(
+                    "➕ افزایش اشتراک",
+                    "admin_extend_sub"
+                ),
+                blue(
+                    "📢 عضویت اجباری",
+                    "admin_force"
+                )
             ],
             [
-                blue("⚙️ تنظیمات تعداد", "admin_limits")
+                blue(
+                    "⚙️ تنظیمات تعداد",
+                    "admin_limits"
+                )
             ],
             [
-                red("🔙 بازگشت", "home")
+                red(
+                    "🔙 بازگشت",
+                    "home"
+                )
             ]
         ]
     }
 
 
 def force_admin_keyboard():
-    status = get_setting("force_join", "0")
-
-    status_text = (
-        "🟢 عضویت اجباری: روشن"
-        if status == "1"
-        else
-        "🔴 عضویت اجباری: خاموش"
+    status = get_setting(
+        "force_join",
+        "0"
     )
+
+    if status == "1":
+        status_button = green(
+            "🟢 عضویت اجباری: روشن",
+            "admin_toggle_force"
+        )
+    else:
+        status_button = red(
+            "🔴 عضویت اجباری: خاموش",
+            "admin_toggle_force"
+        )
 
     return {
         "inline_keyboard": [
             [
-                green(status_text, "admin_toggle_force")
+                status_button
             ],
             [
-                blue("📢 تنظیم کانال", "admin_set_channel")
+                blue(
+                    "📢 تنظیم کانال",
+                    "admin_set_channel"
+                )
             ],
             [
-                red("🔙 بازگشت", "admin")
+                red(
+                    "🔙 بازگشت",
+                    "admin"
+                )
             ]
         ]
     }
@@ -615,30 +766,40 @@ def limits_keyboard():
         "inline_keyboard": [
             [
                 blue(
-                    f"📌 حد ثبت درخواست: {get_report_max()}",
+                    f"📌 سقف ثبت درخواست: {get_report_max()}",
                     "admin_report_limit"
                 )
             ],
             [
                 green(
-                    f"📧 حد بخش ایمیل: {get_email_max()}",
+                    f"📧 سقف بخش ایمیل: {get_email_max()}",
                     "admin_email_limit"
                 )
             ],
             [
-                red("🔙 بازگشت", "admin")
+                red(
+                    "🔙 بازگشت",
+                    "admin"
+                )
             ]
         ]
     }
 
 
-# =========================
+# =========================================================
 # FORCE JOIN
-# =========================
+# =========================================================
 
 def check_membership(user_id):
-    force = get_setting("force_join", "0")
-    channel = get_setting("force_channel", "")
+    force = get_setting(
+        "force_join",
+        "0"
+    )
+
+    channel = get_setting(
+        "force_channel",
+        ""
+    )
 
     if force != "1":
         return True
@@ -660,23 +821,26 @@ def check_membership(user_id):
 
         status = result["result"]["status"]
 
-        return status in [
+        return status in (
             "creator",
             "administrator",
             "member"
-        ]
+        )
 
-    except:
+    except Exception:
         return False
 
 
 def force_join_message(chat_id):
-    channel = get_setting("force_channel", "")
+    channel = get_setting(
+        "force_channel",
+        ""
+    )
 
     if not channel:
         return False
 
-    clean = channel.replace("@", "")
+    clean = channel.strip().replace("@", "")
 
     keyboard = {
         "inline_keyboard": [
@@ -704,11 +868,12 @@ def force_join_message(chat_id):
     return True
 
 
-# =========================
-# USER STATES
-# =========================
+# =========================================================
+# STATES
+# =========================================================
 
 user_states = {}
+admin_states = {}
 
 
 def set_state(user_id, state, data=None):
@@ -726,13 +891,6 @@ def clear_state(user_id):
     user_states.pop(user_id, None)
 
 
-# =========================
-# ADMIN STATES
-# =========================
-
-admin_states = {}
-
-
 def set_admin_state(user_id, state):
     admin_states[user_id] = state
 
@@ -745,37 +903,53 @@ def clear_admin_state(user_id):
     admin_states.pop(user_id, None)
 
 
-# =========================
-# START
-# =========================
+# =========================================================
+# HOME
+# =========================================================
 
 def show_home(chat_id):
     send(
         chat_id,
         "🔥 BREAKING REPO\n\n"
-        "به ربات خوش آمدید.\n"
+        "به ربات خوش آمدید.\n\n"
         "از منوی زیر انتخاب کنید:",
         home_keyboard()
     )
 
 
-# =========================
+# =========================================================
 # CALLBACK HANDLER
-# =========================
+# =========================================================
 
 def handle_callback(query):
+
     callback_id = query["id"]
     data = query.get("data", "")
 
     user = query["from"]
-    user_id = user["id"]
-    chat_id = query["message"]["chat"]["id"]
-    message_id = query["message"]["message_id"]
 
+    user_id = user["id"]
+
+    message = query.get("message")
+
+    if not message:
+        answer(callback_id)
+        return
+
+    chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
+
+    # فقط یک بار پاسخ callback
     answer(callback_id)
 
+    # =====================================================
+    # CHECK JOIN
+    # =====================================================
+
     if data == "check_join":
+
         if check_membership(user_id):
+
             edit(
                 chat_id,
                 message_id,
@@ -783,22 +957,45 @@ def handle_callback(query):
                 "حالا می‌توانید از ربات استفاده کنید.",
                 home_keyboard()
             )
+
         else:
-            answer(
-                callback_id,
-                "❌ هنوز عضویت شما تأیید نشده."
+
+            send(
+                chat_id,
+                "❌ هنوز عضویت شما تأیید نشده است."
             )
 
         return
 
-    # =====================
+    # =====================================================
+    # HOME
+    # =====================================================
+
+    if data == "home":
+
+        clear_state(user_id)
+        clear_admin_state(user_id)
+
+        edit(
+            chat_id,
+            message_id,
+            "🔥 BREAKING REPO\n\n"
+            "منوی اصلی:",
+            home_keyboard()
+        )
+
+        return
+
+    # =====================================================
     # ADMIN
-    # =====================
+    # =====================================================
 
     if data == "admin":
+
         if user_id != ADMIN_ID:
-            answer(callback_id, "❌ دسترسی ندارید.")
             return
+
+        clear_admin_state(user_id)
 
         edit(
             chat_id,
@@ -806,35 +1003,41 @@ def handle_callback(query):
             "🛠 پنل مدیریت BREAKING REPO",
             admin_keyboard()
         )
+
         return
 
     if data == "admin_users":
+
         if user_id != ADMIN_ID:
             return
 
         edit(
             chat_id,
             message_id,
-            f"👥 تعداد کاربران: {users_count()}",
+            f"👥 تعداد کاربران:\n\n{users_count()}",
             admin_keyboard()
         )
+
         return
 
     if data == "admin_stats":
+
         if user_id != ADMIN_ID:
             return
 
         edit(
             chat_id,
             message_id,
-            f"📊 آمار ربات\n\n"
+            "📊 آمار ربات\n\n"
             f"👥 کاربران: {users_count()}\n"
             f"📋 درخواست‌ها: {requests_count()}",
             admin_keyboard()
         )
+
         return
 
     if data == "admin_limits":
+
         if user_id != ADMIN_ID:
             return
 
@@ -842,90 +1045,119 @@ def handle_callback(query):
             chat_id,
             message_id,
             "⚙️ تنظیمات تعداد\n\n"
-            "می‌توانید سقف تعداد هر بخش را جداگانه تغییر دهید.",
+            "سقف دو بخش را می‌توانی جداگانه تغییر بدهی.",
             limits_keyboard()
         )
+
         return
 
     if data == "admin_report_limit":
+
         if user_id != ADMIN_ID:
             return
 
-        set_admin_state(user_id, "report_limit")
+        set_admin_state(
+            user_id,
+            "report_limit"
+        )
 
         edit(
             chat_id,
             message_id,
-            "📌 سقف ثبت درخواست را وارد کنید.\n\n"
-            "مقدار مجاز: 1 تا 100",
+            "📌 سقف ثبت درخواست\n\n"
+            "یک عدد بین 1 تا 100 ارسال کن.",
             back_keyboard()
         )
+
         return
 
     if data == "admin_email_limit":
+
         if user_id != ADMIN_ID:
             return
 
-        set_admin_state(user_id, "email_limit")
+        set_admin_state(
+            user_id,
+            "email_limit"
+        )
 
         edit(
             chat_id,
             message_id,
-            "📧 سقف بخش ایمیل را وارد کنید.\n\n"
-            "مقدار مجاز: 1 تا 100",
+            "📧 سقف بخش ایمیل\n\n"
+            "یک عدد بین 1 تا 100 ارسال کن.",
             back_keyboard()
         )
+
         return
 
     if data == "admin_add_sub":
+
         if user_id != ADMIN_ID:
             return
 
-        set_admin_state(user_id, "add_sub")
+        set_admin_state(
+            user_id,
+            "add_sub"
+        )
 
         edit(
             chat_id,
             message_id,
-            "💎 به این شکل وارد کنید:\n\n"
-            "123456789 30\n\n"
-            "عدد اول = آیدی کاربر\n"
-            "عدد دوم = تعداد روز",
+            "💎 افزودن اشتراک\n\n"
+            "فرمت:\n\n"
+            "USER_ID DAYS\n\n"
+            "مثال:\n"
+            "123456789 30",
             back_keyboard()
         )
+
         return
 
     if data == "admin_remove_sub":
+
         if user_id != ADMIN_ID:
             return
 
-        set_admin_state(user_id, "remove_sub")
+        set_admin_state(
+            user_id,
+            "remove_sub"
+        )
 
         edit(
             chat_id,
             message_id,
-            "🗑 آیدی کاربر را ارسال کنید.",
+            "🗑 آیدی کاربر را ارسال کن.",
             back_keyboard()
         )
+
         return
 
     if data == "admin_extend_sub":
+
         if user_id != ADMIN_ID:
             return
 
-        set_admin_state(user_id, "extend_sub")
+        set_admin_state(
+            user_id,
+            "extend_sub"
+        )
 
         edit(
             chat_id,
             message_id,
-            "➕ به این شکل وارد کنید:\n\n"
-            "123456789 7\n\n"
-            "عدد اول = آیدی کاربر\n"
-            "عدد دوم = تعداد روز برای افزایش",
+            "➕ افزایش اشتراک\n\n"
+            "فرمت:\n\n"
+            "USER_ID DAYS\n\n"
+            "مثال:\n"
+            "123456789 7",
             back_keyboard()
         )
+
         return
 
     if data == "admin_force":
+
         if user_id != ADMIN_ID:
             return
 
@@ -935,13 +1167,18 @@ def handle_callback(query):
             "📢 تنظیمات عضویت اجباری",
             force_admin_keyboard()
         )
+
         return
 
     if data == "admin_toggle_force":
+
         if user_id != ADMIN_ID:
             return
 
-        current = get_setting("force_join", "0")
+        current = get_setting(
+            "force_join",
+            "0"
+        )
 
         set_setting(
             "force_join",
@@ -954,51 +1191,43 @@ def handle_callback(query):
             "📢 تنظیمات عضویت اجباری",
             force_admin_keyboard()
         )
+
         return
 
     if data == "admin_set_channel":
+
         if user_id != ADMIN_ID:
             return
 
-        set_admin_state(user_id, "set_channel")
+        set_admin_state(
+            user_id,
+            "set_channel"
+        )
 
         edit(
             chat_id,
             message_id,
-            "📢 آیدی کانال را ارسال کنید.\n\n"
+            "📢 آیدی کانال را ارسال کن.\n\n"
             "مثال:\n"
             "@MyChannel",
             back_keyboard()
         )
+
         return
 
-    # =====================
-    # HOME
-    # =====================
-
-    if data == "home":
-        clear_state(user_id)
-        clear_admin_state(user_id)
-
-        edit(
-            chat_id,
-            message_id,
-            "🔥 BREAKING REPO\n\n"
-            "منوی اصلی:",
-            home_keyboard()
-        )
-        return
-
-    # =====================
-    # REQUEST
-    # =====================
+    # =====================================================
+    # USER REQUEST
+    # =====================================================
 
     if data == "request":
+
         if not check_membership(user_id):
+
             force_join_message(chat_id)
             return
 
         if not has_subscription(user_id):
+
             edit(
                 chat_id,
                 message_id,
@@ -1020,6 +1249,7 @@ def handle_callback(query):
                     ]
                 }
             )
+
             return
 
         edit(
@@ -1031,30 +1261,39 @@ def handle_callback(query):
             "https://t.me/example",
             request_keyboard()
         )
+
         return
 
     if data == "request_link":
-        set_state(user_id, "waiting_report_link")
+
+        set_state(
+            user_id,
+            "waiting_report_link"
+        )
 
         edit(
             chat_id,
             message_id,
-            "🔗 لینک تلگرام را ارسال کنید.\n\n"
-            "فقط لینک‌هایی با دامنه t.me یا telegram.me پذیرفته می‌شوند.",
+            "🔗 لینک تلگرام را ارسال کن.\n\n"
+            "فقط لینک‌های t.me و telegram.me قبول می‌شوند.",
             back_keyboard()
         )
+
         return
 
-    # =====================
+    # =====================================================
     # EMAIL
-    # =====================
+    # =====================================================
 
     if data == "email":
+
         if not check_membership(user_id):
+
             force_join_message(chat_id)
             return
 
         if not has_subscription(user_id):
+
             edit(
                 chat_id,
                 message_id,
@@ -1076,59 +1315,73 @@ def handle_callback(query):
                     ]
                 }
             )
+
             return
 
         edit(
             chat_id,
             message_id,
             "📧 بخش ایمیل\n\n"
-            "متن موردنظر خود را ارسال کنید.",
+            "متن موردنظر را ارسال کن.",
             email_keyboard()
         )
+
         return
 
     if data == "email_text":
-        set_state(user_id, "waiting_email_text")
+
+        set_state(
+            user_id,
+            "waiting_email_text"
+        )
 
         edit(
             chat_id,
             message_id,
-            "📧 متن ایمیل را ارسال کنید.",
+            "📧 متن ایمیل را ارسال کن.",
             back_keyboard()
         )
+
         return
 
-    # =====================
+    # =====================================================
     # ACCOUNT
-    # =====================
+    # =====================================================
 
     if data == "account":
+
         edit(
             chat_id,
             message_id,
-            "👤 حساب شما\n\n"
-            f"🆔 آیدی: {user_id}\n"
-            f"💎 وضعیت اشتراک:\n{subscription_text(user_id)}",
+            "👤 حساب من\n\n"
+            f"🆔 آیدی: {user_id}\n\n"
+            f"💎 وضعیت:\n{subscription_text(user_id)}",
             back_keyboard()
         )
+
         return
 
     if data == "status":
+
         conn = db()
 
-        pending = conn.execute("""
-            SELECT COUNT(*) AS c
-            FROM requests
-            WHERE user_id=? AND status='pending'
-        """, (user_id,)).fetchone()["c"]
+        try:
+            pending = conn.execute("""
+                SELECT COUNT(*) AS c
+                FROM requests
+                WHERE user_id=?
+                AND status='pending'
+            """, (user_id,)).fetchone()["c"]
 
-        completed = conn.execute("""
-            SELECT COUNT(*) AS c
-            FROM requests
-            WHERE user_id=? AND status='completed'
-        """, (user_id,)).fetchone()["c"]
+            completed = conn.execute("""
+                SELECT COUNT(*) AS c
+                FROM requests
+                WHERE user_id=?
+                AND status='completed'
+            """, (user_id,)).fetchone()["c"]
 
-        conn.close()
+        finally:
+            conn.close()
 
         edit(
             chat_id,
@@ -1138,44 +1391,56 @@ def handle_callback(query):
             f"✅ تکمیل‌شده: {completed}",
             back_keyboard()
         )
+
         return
 
     if data == "myid":
+
         edit(
             chat_id,
             message_id,
             f"🆔 آیدی عددی شما:\n\n{user_id}",
             back_keyboard()
         )
+
         return
 
     if data == "support":
+
         edit(
             chat_id,
             message_id,
             "💬 پشتیبانی\n\n"
-            "برای ارتباط با پشتیبانی از آیدی درج‌شده توسط مدیریت استفاده کنید.",
+            "برای ارتباط با پشتیبانی از راه ارتباطی تعیین‌شده توسط مدیریت استفاده کنید.",
             back_keyboard()
         )
+
         return
 
     if data == "subscription":
+
         edit(
             chat_id,
             message_id,
-            "💎 اشتراک شما\n\n"
+            "💎 اشتراک\n\n"
             + subscription_text(user_id),
             back_keyboard()
         )
+
         return
 
 
-# =========================
+# =========================================================
 # MESSAGE HANDLER
-# =========================
+# =========================================================
 
 def handle_message(message):
-    user = message["from"]
+
+    user = message.get("from")
+
+    if not user:
+        return
+
     user_id = user["id"]
     chat_id = message["chat"]["id"]
 
@@ -1183,30 +1448,39 @@ def handle_message(message):
 
     text = message.get("text", "").strip()
 
-    # =====================
+    # =====================================================
     # START
-    # =====================
+    # =====================================================
 
-    if text == "/start":
+    if text.startswith("/start"):
+
         clear_state(user_id)
         clear_admin_state(user_id)
 
         if not check_membership(user_id):
+
             if force_join_message(chat_id):
                 return
 
         show_home(chat_id)
         return
 
-    # =====================
-    # ADMIN COMMAND
-    # =====================
+    # =====================================================
+    # ADMIN
+    # =====================================================
 
     if text == "/admin":
+
         if user_id != ADMIN_ID:
-            send(chat_id, "❌ شما دسترسی مدیریت ندارید.")
+
+            send(
+                chat_id,
+                "❌ شما دسترسی مدیریت ندارید."
+            )
+
             return
 
+        clear_state(user_id)
         clear_admin_state(user_id)
 
         send(
@@ -1214,24 +1488,34 @@ def handle_message(message):
             "🛠 پنل مدیریت BREAKING REPO",
             admin_keyboard()
         )
+
         return
 
-    # =====================
-    # ADMIN TEXT STATES
-    # =====================
+    # =====================================================
+    # ADMIN STATES
+    # =====================================================
 
     admin_state = get_admin_state(user_id)
 
     if user_id == ADMIN_ID and admin_state:
 
+        # -------------------------------------------------
+        # REPORT LIMIT
+        # -------------------------------------------------
+
         if admin_state == "report_limit":
+
             try:
                 value = int(text)
 
                 if not 1 <= value <= 100:
                     raise ValueError
 
-                set_setting("report_max", value)
+                set_setting(
+                    "report_max",
+                    value
+                )
+
                 clear_admin_state(user_id)
 
                 send(
@@ -1240,23 +1524,33 @@ def handle_message(message):
                     limits_keyboard()
                 )
 
-            except:
+            except Exception:
+
                 send(
                     chat_id,
-                    "❌ مقدار نامعتبر است.\n"
-                    "یک عدد بین 1 تا 100 ارسال کنید."
+                    "❌ مقدار اشتباه است.\n\n"
+                    "یک عدد بین 1 تا 100 ارسال کن."
                 )
 
             return
 
+        # -------------------------------------------------
+        # EMAIL LIMIT
+        # -------------------------------------------------
+
         if admin_state == "email_limit":
+
             try:
                 value = int(text)
 
                 if not 1 <= value <= 100:
                     raise ValueError
 
-                set_setting("email_max", value)
+                set_setting(
+                    "email_max",
+                    value
+                )
+
                 clear_admin_state(user_id)
 
                 send(
@@ -1265,26 +1559,39 @@ def handle_message(message):
                     limits_keyboard()
                 )
 
-            except:
+            except Exception:
+
                 send(
                     chat_id,
-                    "❌ مقدار نامعتبر است.\n"
-                    "یک عدد بین 1 تا 100 ارسال کنید."
+                    "❌ مقدار اشتباه است.\n\n"
+                    "یک عدد بین 1 تا 100 ارسال کن."
                 )
 
             return
 
+        # -------------------------------------------------
+        # ADD SUB
+        # -------------------------------------------------
+
         if admin_state == "add_sub":
+
             try:
                 parts = text.split()
+
+                if len(parts) != 2:
+                    raise ValueError
 
                 target_id = int(parts[0])
                 days = int(parts[1])
 
-                if days <= 0:
+                if target_id <= 0 or days <= 0:
                     raise ValueError
 
-                add_subscription(target_id, days)
+                add_subscription(
+                    target_id,
+                    days
+                )
+
                 clear_admin_state(user_id)
 
                 send(
@@ -1293,7 +1600,8 @@ def handle_message(message):
                     admin_keyboard()
                 )
 
-            except:
+            except Exception:
+
                 send(
                     chat_id,
                     "❌ فرمت اشتباه است.\n\n"
@@ -1303,17 +1611,29 @@ def handle_message(message):
 
             return
 
+        # -------------------------------------------------
+        # EXTEND SUB
+        # -------------------------------------------------
+
         if admin_state == "extend_sub":
+
             try:
                 parts = text.split()
+
+                if len(parts) != 2:
+                    raise ValueError
 
                 target_id = int(parts[0])
                 days = int(parts[1])
 
-                if days <= 0:
+                if target_id <= 0 or days <= 0:
                     raise ValueError
 
-                add_subscription(target_id, days)
+                add_subscription(
+                    target_id,
+                    days
+                )
+
                 clear_admin_state(user_id)
 
                 send(
@@ -1322,7 +1642,8 @@ def handle_message(message):
                     admin_keyboard()
                 )
 
-            except:
+            except Exception:
+
                 send(
                     chat_id,
                     "❌ فرمت اشتباه است.\n\n"
@@ -1332,11 +1653,22 @@ def handle_message(message):
 
             return
 
+        # -------------------------------------------------
+        # REMOVE SUB
+        # -------------------------------------------------
+
         if admin_state == "remove_sub":
+
             try:
                 target_id = int(text)
 
-                remove_subscription(target_id)
+                if target_id <= 0:
+                    raise ValueError
+
+                remove_subscription(
+                    target_id
+                )
+
                 clear_admin_state(user_id)
 
                 send(
@@ -1345,7 +1677,8 @@ def handle_message(message):
                     admin_keyboard()
                 )
 
-            except:
+            except Exception:
+
                 send(
                     chat_id,
                     "❌ آیدی نامعتبر است."
@@ -1353,51 +1686,66 @@ def handle_message(message):
 
             return
 
+        # -------------------------------------------------
+        # CHANNEL
+        # -------------------------------------------------
+
         if admin_state == "set_channel":
+
             channel = text.strip()
 
             if not channel.startswith("@"):
+
                 send(
                     chat_id,
                     "❌ آیدی کانال باید با @ شروع شود.\n\n"
                     "مثال:\n"
                     "@MyChannel"
                 )
+
                 return
 
-            set_setting("force_channel", channel)
+            set_setting(
+                "force_channel",
+                channel
+            )
+
             clear_admin_state(user_id)
 
             send(
                 chat_id,
-                f"✅ کانال تنظیم شد:\n{channel}",
+                f"✅ کانال تنظیم شد:\n\n{channel}",
                 force_admin_keyboard()
             )
 
             return
 
-    # =====================
-    # USER STATE
-    # =====================
+    # =====================================================
+    # USER STATES
+    # =====================================================
 
     state = get_state(user_id)
 
     if not state:
         return
 
-    # =====================
-    # TELEGRAM LINK
-    # =====================
+    current_state = state["state"]
 
-    if state["state"] == "waiting_report_link":
+    # =====================================================
+    # TELEGRAM LINK
+    # =====================================================
+
+    if current_state == "waiting_report_link":
 
         if not is_telegram_link(text):
+
             send(
                 chat_id,
                 "❌ فقط لینک تلگرام قبول می‌شود.\n\n"
-                "مثال صحیح:\n"
+                "نمونه صحیح:\n"
                 "https://t.me/example"
             )
+
             return
 
         set_state(
@@ -1410,36 +1758,41 @@ def handle_message(message):
 
         send(
             chat_id,
-            f"🔢 تعداد را وارد کنید.\n\n"
+            "🔢 تعداد را ارسال کن.\n\n"
             f"حداکثر فعلی: {get_report_max()}\n\n"
-            "یک عدد بین 1 تا سقف تعیین‌شده ارسال کنید.",
+            "عدد باید بین 1 و سقف تعیین‌شده باشد.",
             back_keyboard()
         )
 
         return
 
-    # =====================
+    # =====================================================
     # REPORT COUNT
-    # =====================
+    # =====================================================
 
-    if state["state"] == "waiting_report_count":
+    if current_state == "waiting_report_count":
 
         try:
             count = int(text)
-        except:
+
+        except Exception:
+
             send(
                 chat_id,
-                "❌ فقط عدد وارد کنید."
+                "❌ فقط عدد ارسال کن."
             )
+
             return
 
         maximum = get_report_max()
 
         if count < 1 or count > maximum:
+
             send(
                 chat_id,
                 f"❌ تعداد باید بین 1 تا {maximum} باشد."
             )
+
             return
 
         target = state["data"]["target"]
@@ -1463,23 +1816,29 @@ def handle_message(message):
 
         threading.Thread(
             target=delayed_result,
-            args=(chat_id, request_id, "report"),
+            args=(
+                chat_id,
+                request_id,
+                "report"
+            ),
             daemon=True
         ).start()
 
         return
 
-    # =====================
+    # =====================================================
     # EMAIL TEXT
-    # =====================
+    # =====================================================
 
-    if state["state"] == "waiting_email_text":
+    if current_state == "waiting_email_text":
 
         if len(text) < 3:
+
             send(
                 chat_id,
                 "❌ متن ایمیل خیلی کوتاه است."
             )
+
             return
 
         set_state(
@@ -1492,36 +1851,41 @@ def handle_message(message):
 
         send(
             chat_id,
-            f"🔢 تعداد را وارد کنید.\n\n"
+            "🔢 تعداد را ارسال کن.\n\n"
             f"حداکثر فعلی: {get_email_max()}\n\n"
-            "یک عدد بین 1 تا سقف تعیین‌شده ارسال کنید.",
+            "عدد باید بین 1 و سقف تعیین‌شده باشد.",
             back_keyboard()
         )
 
         return
 
-    # =====================
+    # =====================================================
     # EMAIL COUNT
-    # =====================
+    # =====================================================
 
-    if state["state"] == "waiting_email_count":
+    if current_state == "waiting_email_count":
 
         try:
             count = int(text)
-        except:
+
+        except Exception:
+
             send(
                 chat_id,
-                "❌ فقط عدد وارد کنید."
+                "❌ فقط عدد ارسال کن."
             )
+
             return
 
         maximum = get_email_max()
 
         if count < 1 or count > maximum:
+
             send(
                 chat_id,
                 f"❌ تعداد باید بین 1 تا {maximum} باشد."
             )
+
             return
 
         target = state["data"]["target"]
@@ -1544,43 +1908,91 @@ def handle_message(message):
 
         threading.Thread(
             target=delayed_result,
-            args=(chat_id, request_id, "email"),
+            args=(
+                chat_id,
+                request_id,
+                "email"
+            ),
             daemon=True
         ).start()
 
         return
 
 
-# =========================
-# UPDATE LOOP
-# =========================
+# =========================================================
+# UPDATE
+# =========================================================
 
 def process_update(update):
+
     try:
 
         if "callback_query" in update:
+
             handle_callback(
                 update["callback_query"]
             )
 
         elif "message" in update:
+
             handle_message(
                 update["message"]
             )
 
     except Exception as e:
-        print("UPDATE ERROR:", e)
 
+        print(
+            "UPDATE ERROR:",
+            repr(e)
+        )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
-    print("BREAKING REPO started...")
 
-    # حذف webhook
-    tg("deleteWebhook")
+    print("================================")
+    print("BREAKING REPO")
+    print("Bot is starting...")
+    print("================================")
+
+    # تست اتصال توکن
+    me = tg("getMe")
+
+    if not me.get("ok"):
+
+        print("❌ BOT TOKEN یا اتصال مشکل دارد.")
+        print(me)
+
+        raise RuntimeError(
+            "اتصال به Telegram API برقرار نشد."
+        )
+
+    bot_info = me["result"]
+
+    print(
+        f"✅ Connected to @{bot_info.get('username', 'unknown')}"
+    )
+
+    # حذف webhook قبلی
+    delete_result = tg(
+        "deleteWebhook",
+        {
+            "drop_pending_updates": False
+        }
+    )
+
+    print(
+        "Webhook:",
+        delete_result
+    )
 
     offset = 0
 
     while True:
+
         try:
 
             result = tg(
@@ -1588,18 +2000,27 @@ def main():
                 {
                     "offset": offset,
                     "timeout": 30,
-                    "allowed_updates": [
+                    "allowed_updates": json.dumps([
                         "message",
                         "callback_query"
-                    ]
+                    ])
                 }
             )
 
             if not result.get("ok"):
-                time.sleep(3)
+
+                print(
+                    "getUpdates failed:",
+                    result
+                )
+
+                time.sleep(5)
                 continue
 
-            updates = result.get("result", [])
+            updates = result.get(
+                "result",
+                []
+            )
 
             for update in updates:
 
@@ -1607,10 +2028,24 @@ def main():
 
                 process_update(update)
 
-        except Exception as e:
-            print("LOOP ERROR:", e)
-            time.sleep(3)
+        except KeyboardInterrupt:
 
+            print("Bot stopped.")
+            break
+
+        except Exception as e:
+
+            print(
+                "MAIN LOOP ERROR:",
+                repr(e)
+            )
+
+            time.sleep(5)
+
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
